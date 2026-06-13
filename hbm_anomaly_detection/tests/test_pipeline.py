@@ -760,3 +760,58 @@ class TestDeepAutoencoderDetector:
             f"Expected more deep_anomaly events on vibration wafer "
             f"({n_anom_deep}) than normal wafer ({n_normal_deep})"
         )
+
+    def test_no_retrain_by_default(self):
+        """retrain_interval_wafers=0 (default) never re-fits after the initial fit."""
+        cfg = _test_config()
+        assert cfg.autoencoder.retrain_interval_wafers == 0
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.autoencoder.baseline_wafers + 5,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=97,
+        )
+        for w in wafers:
+            pipeline.process_wafer(w)
+
+        key = wafers[0].group_key
+        state = pipeline._autoencoder_detector._states[key]
+        assert state.fitted
+        assert state.training_data == []
+        assert state.n_wafers_since_fit == 0
+
+    def test_periodic_retrain(self):
+        """With retrain_interval_wafers set, the autoencoder is re-fit periodically."""
+        cfg = _test_config()
+        cfg.autoencoder.retrain_interval_wafers = 3
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.autoencoder.baseline_wafers + 1,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=97,
+        )
+        for w in wafers:
+            pipeline.process_wafer(w)
+
+        key = wafers[0].group_key
+        state = pipeline._autoencoder_detector._states[key]
+        assert state.fitted
+        first_autoencoder = state.autoencoder
+
+        # Two more wafers: buffered but not yet enough to trigger a retrain.
+        more_wafers = make_normal_wafer_sequence(
+            n_wafers=2, n_chips=N_CHIPS, n_points=N_POINTS, seed=98,
+        )
+        for w in more_wafers:
+            pipeline.process_wafer(w)
+        assert state.autoencoder is first_autoencoder
+        assert state.n_wafers_since_fit == 2
+
+        # One more wafer reaches retrain_interval_wafers and triggers a re-fit.
+        retrain_wafer = make_normal_wafer(wafer_id="RETRAIN", n_chips=N_CHIPS, n_points=N_POINTS,
+                                           rng=np.random.default_rng(99))
+        pipeline.process_wafer(retrain_wafer)
+
+        assert state.autoencoder is not first_autoencoder
+        assert state.training_data == []
+        assert state.n_wafers_since_fit == 0

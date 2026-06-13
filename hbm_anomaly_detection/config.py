@@ -72,11 +72,12 @@ class AutoencoderConfig:
     input_length: int = 25          # per-channel downsample length (input dim = 2 * input_length)
     hidden_dim: int = 16            # hidden layer width
     bottleneck_dim: int = 4         # bottleneck (latent) width
-    baseline_wafers: int = 8        # wafers of chip residuals collected before training
+    baseline_wafers: int = 8        # wafers of chip residuals collected before initial training
     epochs: int = 150               # full-batch training epochs
     learning_rate: float = 0.02     # Adam learning rate
     threshold_percentile: float = 99.0  # training-error percentile used as the alarm threshold
     seed: int = 0                   # weight initialization seed
+    retrain_interval_wafers: int = 0  # wafers between retrains after the initial fit (0 = never retrain)
 
 
 @dataclass

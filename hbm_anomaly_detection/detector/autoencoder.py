@@ -152,12 +152,17 @@ class AutoencoderState:
     During the baseline period (first ``baseline_wafers`` wafers), chip
     residual vectors are buffered. Once enough wafers are collected, the
     autoencoder is fit once on the buffered data and the buffer is dropped.
+
+    If ``retrain_interval_wafers`` > 0, residual vectors keep being buffered
+    after the initial fit and the autoencoder is periodically re-fit (and
+    its threshold/scale recomputed) on the most recent window of wafers.
     """
     autoencoder: SimpleAutoencoder | None = None
     training_data: list[np.ndarray] = field(default_factory=list)
     scale: np.ndarray = field(default_factory=lambda: np.ones(2))
     threshold: float = 0.0
     n_wafers_seen: int = 0
+    n_wafers_since_fit: int = 0
     fitted: bool = False
 
 
@@ -189,6 +194,11 @@ class AutoencoderAnomalyDetector:
         and return no events. Once fitted, score each chip's residual vector
         by reconstruction error and emit a ``deep_anomaly`` event for chips
         that exceed the training-derived threshold.
+
+        If ``cfg.retrain_interval_wafers`` > 0, residual vectors are also
+        buffered after fitting, and the autoencoder is re-fit (with a fresh
+        scale and threshold) every ``retrain_interval_wafers`` wafers using
+        the wafers seen since the last fit.
 
         ``chips`` and ``residual_vectors`` must be aligned (same order,
         same length).
@@ -224,6 +234,12 @@ class AutoencoderAnomalyDetector:
                     },
                 ))
 
+        if cfg.retrain_interval_wafers > 0:
+            state.training_data.extend(residual_vectors)
+            state.n_wafers_since_fit += 1
+            if state.n_wafers_since_fit >= cfg.retrain_interval_wafers:
+                self._fit(state, cfg)
+
         return events
 
     def _fit(self, state: AutoencoderState, cfg: AutoencoderConfig) -> None:
@@ -246,6 +262,7 @@ class AutoencoderAnomalyDetector:
         state.threshold = float(np.percentile(ae.reconstruction_error(X), cfg.threshold_percentile))
         state.fitted = True
         state.training_data = []
+        state.n_wafers_since_fit = 0
 
     def _normalize(self, state: AutoencoderState, X: np.ndarray) -> np.ndarray:
         L = self.config.input_length
