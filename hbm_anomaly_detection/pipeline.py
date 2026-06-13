@@ -29,6 +29,8 @@ from .detector.intra_wafer import detect_intra_wafer_drift
 from .detector.inter_wafer import InterWaferTracker
 from .detector.spike_detector import detect_chip_spikes, SpikeRateTracker
 from .detector.coupling_detector import CouplingDetector
+from .detector.multivariate_inter_wafer import MultivariateInterWaferTracker
+from .detector.autoencoder import AutoencoderAnomalyDetector, extract_residual_vector
 
 
 class AnomalyDetectionPipeline:
@@ -46,6 +48,8 @@ class AnomalyDetectionPipeline:
         self._inter_tracker = InterWaferTracker(self._config.inter_wafer)
         self._spike_rate_tracker = SpikeRateTracker(self._config.spike)
         self._coupling_detector = CouplingDetector(self._config.coupling)
+        self._mv_inter_tracker = MultivariateInterWaferTracker(self._config.multivariate_inter_wafer)
+        self._autoencoder_detector = AutoencoderAnomalyDetector(self._config.autoencoder)
 
     def process_wafer(
         self,
@@ -83,6 +87,7 @@ class AnomalyDetectionPipeline:
 
         # --- Step 2: Extract per-chip features ---
         chip_features: list[ChipFeatures] = []
+        residual_vectors: list[np.ndarray] = []
         for chip in wafer.chips:
             temp_ref, resist_ref, cluster = self._ref_manager.get_references(chip, ref)
             if len(temp_ref) == 0 or len(resist_ref) == 0:
@@ -91,6 +96,9 @@ class AnomalyDetectionPipeline:
                 chip, temp_ref, resist_ref, cluster, self._config.feature
             )
             chip_features.append(feat)
+            residual_vectors.append(extract_residual_vector(
+                chip, temp_ref, resist_ref, self._config.autoencoder.input_length
+            ))
 
         if not chip_features:
             if update_reference:
@@ -139,11 +147,21 @@ class AnomalyDetectionPipeline:
             key, wafer.wafer_id, summary_temp["mean"], channel="temp"
         ))
 
+        # 3c-bis. Joint (temp, resist) inter-wafer drift via Hotelling's T^2 (MEWMA)
+        events.extend(self._mv_inter_tracker.update_and_detect(
+            key, wafer.wafer_id, np.array([summary_temp["mean"], summary["mean"]])
+        ))
+
         # 3d. Bimodal coupling breakdown
         events.extend(self._coupling_detector.process_wafer(
             wafer,
             key,
             bimodal_separation_threshold=self._config.reference.bimodal_separation_threshold,
+        ))
+
+        # 3e. Deep autoencoder anomaly detection (joint temp+resist residual signature)
+        events.extend(self._autoencoder_detector.process_wafer(
+            key, wafer.wafer_id, [f.chip for f in chip_features], residual_vectors
         ))
 
         # --- Step 4: Update reference with this wafer (after detection) ---

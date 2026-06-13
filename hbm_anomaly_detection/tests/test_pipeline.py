@@ -17,6 +17,8 @@ from ..config import (
     SpikeConfig,
     CouplingConfig,
     FeatureConfig,
+    MultivariateInterWaferConfig,
+    AutoencoderConfig,
 )
 from ..pipeline import AnomalyDetectionPipeline
 from ..simulator import (
@@ -60,6 +62,20 @@ def _test_config() -> AnomalyConfig:
             coupling_sigma=2.5,
             baseline_wafers=5,
             ewma_lambda=0.3,
+        ),
+        multivariate_inter_wafer=MultivariateInterWaferConfig(
+            ewma_lambda=0.3,
+            alert_alpha=0.05,
+            baseline_wafers=5,
+        ),
+        autoencoder=AutoencoderConfig(
+            input_length=10,
+            hidden_dim=8,
+            bottleneck_dim=2,
+            baseline_wafers=5,
+            epochs=80,
+            learning_rate=0.05,
+            threshold_percentile=99.0,
         ),
     )
 
@@ -579,3 +595,168 @@ class TestPipelineIntegration:
         assert ref2 is not None
         # References are tracked independently
         assert ref1 is not ref2
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Multivariate (Hotelling's T^2) inter-wafer drift detection
+# ---------------------------------------------------------------------------
+
+class TestMultivariateInterWaferDrift:
+    def test_no_spurious_joint_drift(self):
+        """A clean wafer sequence should not trigger inter_drift_mv alerts."""
+        cfg = _test_config()
+        pipeline = AnomalyDetectionPipeline(cfg)
+        wafers = make_normal_wafer_sequence(
+            n_wafers=20, n_chips=N_CHIPS, n_points=N_POINTS, seed=90
+        )
+        results = pipeline.process_wafer_sequence(wafers)
+        n_mv = _count_events(results, "inter_drift_mv")
+        assert n_mv <= 2, f"Too many inter_drift_mv false positives: {n_mv}"
+
+    def test_joint_drift_detected(self):
+        """
+        A sequence with gradually increasing resist roughness across wafers
+        should trigger inter_drift_mv alerts in the drifting portion: the
+        joint [temp_roughness_mean, resist_roughness_mean] vector moves
+        outside the baseline covariance ellipse even though temp roughness
+        stays flat.
+        """
+        cfg = _test_config()
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        wafers = make_inter_wafer_drift_sequence(
+            n_normal=12,
+            n_drift=10,
+            n_chips=N_CHIPS,
+            n_points=N_POINTS,
+            base_noise_std=0.02,
+            drift_multiplier_final=5.0,
+            seed=91,
+        )
+        results = pipeline.process_wafer_sequence(wafers)
+
+        drift_wafer_ids = {w.wafer_id for w in wafers[12:]}
+        mv_alerts = sum(
+            1 for wid, evts in results.items()
+            if wid in drift_wafer_ids
+            for e in evts
+            if e.anomaly_type == "inter_drift_mv"
+        )
+        assert mv_alerts >= 1, (
+            "Expected at least one inter_drift_mv alert in drifting wafer portion"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: NumPy autoencoder building blocks
+# ---------------------------------------------------------------------------
+
+class TestSimpleAutoencoder:
+    def test_reconstruction_error_decreases_with_training(self):
+        """Training should reduce mean reconstruction error on the training set."""
+        from ..detector.autoencoder import SimpleAutoencoder
+        rng = np.random.default_rng(0)
+        X = rng.normal(0, 1, size=(50, 10))
+
+        ae = SimpleAutoencoder(input_dim=10, hidden_dim=8, bottleneck_dim=2, seed=0)
+        err_before = float(ae.reconstruction_error(X).mean())
+        ae.fit(X, epochs=200, lr=0.05)
+        err_after = float(ae.reconstruction_error(X).mean())
+
+        assert err_after < err_before
+
+    def test_downsample_shape_and_mean(self):
+        from ..detector.autoencoder import _downsample
+        x = np.arange(100, dtype=float)
+        ds = _downsample(x, 10)
+        assert len(ds) == 10
+        assert ds[0] == pytest.approx(np.mean(x[:10]))
+
+    def test_extract_residual_vector_shape(self):
+        from ..detector.autoencoder import extract_residual_vector
+        from ..simulator import make_normal_chip
+        rng = np.random.default_rng(5)
+        chip = make_normal_chip(
+            "EQ1", "R1", "H1", "W1", 0, 0, 0, n_points=N_POINTS, rng=rng
+        )
+        ref = np.zeros(N_POINTS)
+        vec = extract_residual_vector(chip, ref, ref, target_len=10)
+        assert vec.shape == (20,)
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Deep autoencoder anomaly detector integration
+# ---------------------------------------------------------------------------
+
+class TestDeepAutoencoderDetector:
+    def test_fits_after_baseline(self):
+        """After baseline_wafers normal wafers, the autoencoder should be fitted."""
+        cfg = _test_config()
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.autoencoder.baseline_wafers + 2,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=92,
+        )
+        for w in wafers:
+            pipeline.process_wafer(w)
+
+        key = wafers[0].group_key
+        state = pipeline._autoencoder_detector._states[key]
+        assert state.fitted
+
+    def test_normal_wafer_low_fp_rate(self):
+        """After fitting, normal wafers should have a low deep_anomaly FP rate."""
+        cfg = _test_config()
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        n_wafers = 20
+        wafers = make_normal_wafer_sequence(
+            n_wafers=n_wafers, n_chips=N_CHIPS, n_points=N_POINTS, seed=93
+        )
+        results = pipeline.process_wafer_sequence(wafers)
+
+        n_deep = _count_events(results, "deep_anomaly")
+        # 1 cold-start wafer (reference init only) + baseline_wafers buffered
+        # for training are never scored.
+        n_scored_wafers = n_wafers - 1 - cfg.autoencoder.baseline_wafers
+        fp_rate = n_deep / (n_scored_wafers * N_CHIPS)
+        assert fp_rate <= 0.05, (
+            f"deep_anomaly FP rate {fp_rate:.1%} too high on normal data"
+        )
+
+    def test_vibration_wafer_more_anomalies_than_normal(self):
+        """
+        A wafer with strong, wafer-wide vibration increase should produce
+        more deep_anomaly events than a normal wafer scored by the same
+        fitted autoencoder.
+        """
+        cfg = _test_config()
+        pipeline = AnomalyDetectionPipeline(cfg)
+
+        baseline_wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.autoencoder.baseline_wafers + 1,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=94,
+        )
+        for w in baseline_wafers:
+            pipeline.process_wafer(w)
+
+        rng_normal = np.random.default_rng(95)
+        normal_wafer = make_normal_wafer(
+            wafer_id="DEEP_NORMAL", n_chips=N_CHIPS, n_points=N_POINTS, rng=rng_normal
+        )
+        normal_events = pipeline.process_wafer(normal_wafer)
+        n_normal_deep = sum(1 for e in normal_events if e.anomaly_type == "deep_anomaly")
+
+        rng_anom = np.random.default_rng(96)
+        anomaly_wafer = make_intra_vibration_wafer(
+            wafer_id="DEEP_ANOM", n_chips=N_CHIPS, n_points=N_POINTS,
+            onset_fraction=0.0, max_noise_multiplier=8.0, rng=rng_anom,
+        )
+        anomaly_events = pipeline.process_wafer(anomaly_wafer)
+        n_anom_deep = sum(1 for e in anomaly_events if e.anomaly_type == "deep_anomaly")
+
+        assert n_anom_deep > n_normal_deep, (
+            f"Expected more deep_anomaly events on vibration wafer "
+            f"({n_anom_deep}) than normal wafer ({n_normal_deep})"
+        )

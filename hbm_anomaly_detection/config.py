@@ -53,6 +53,33 @@ class CouplingConfig:
 
 
 @dataclass
+class MultivariateInterWaferConfig:
+    """
+    Joint (temp, resist) inter-wafer drift via Hotelling's T-squared on a
+    Multivariate EWMA of [temp_roughness_mean, resist_roughness_mean].
+    """
+    ewma_lambda: float = 0.2        # MEWMA smoothing for the joint vector
+    alert_alpha: float = 0.01       # alarm if T^2 exceeds the chi2(df=2) upper alert_alpha quantile
+    baseline_wafers: int = 10       # wafers used to establish (and then freeze) mean/covariance
+
+
+@dataclass
+class AutoencoderConfig:
+    """
+    Simple NumPy-only MLP autoencoder over downsampled [temp_residual,
+    resist_residual] per chip. Reconstruction error is the anomaly score.
+    """
+    input_length: int = 25          # per-channel downsample length (input dim = 2 * input_length)
+    hidden_dim: int = 16            # hidden layer width
+    bottleneck_dim: int = 4         # bottleneck (latent) width
+    baseline_wafers: int = 8        # wafers of chip residuals collected before training
+    epochs: int = 150               # full-batch training epochs
+    learning_rate: float = 0.02     # Adam learning rate
+    threshold_percentile: float = 99.0  # training-error percentile used as the alarm threshold
+    seed: int = 0                   # weight initialization seed
+
+
+@dataclass
 class AnomalyConfig:
     """Top-level configuration aggregating all sub-configs."""
     reference: ReferenceConfig = field(default_factory=ReferenceConfig)
@@ -61,6 +88,8 @@ class AnomalyConfig:
     inter_wafer: InterWaferConfig = field(default_factory=InterWaferConfig)
     spike: SpikeConfig = field(default_factory=SpikeConfig)
     coupling: CouplingConfig = field(default_factory=CouplingConfig)
+    multivariate_inter_wafer: MultivariateInterWaferConfig = field(default_factory=MultivariateInterWaferConfig)
+    autoencoder: AutoencoderConfig = field(default_factory=AutoencoderConfig)
 
 
 DEFAULT_CONFIG = AnomalyConfig()
