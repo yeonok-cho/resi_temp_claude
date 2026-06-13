@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from .config import AnomalyConfig, DEFAULT_CONFIG
-from .data_models import WaferData, WaferFeatures, ChipFeatures, AnomalyEvent
+from .data_models import WaferData, WaferFeatures, ChipFeatures, AnomalyEvent, GroupKey
 from .reference_manager import ReferenceManager
 from .feature_extractor import extract_chip_features
 from .detector.intra_wafer import detect_intra_wafer_drift
@@ -37,10 +37,28 @@ class TempVibrationPipeline:
         self._ref_manager = ReferenceManager(self._config.reference)
         self._inter_tracker = InterWaferTracker(self._config.inter_wafer)
 
+    def reset_baseline(self, group_key: GroupKey) -> None:
+        """
+        Reset all baseline state for a group after a PM (Preventive
+        Maintenance) event.
+
+        The temperature reference profile and the inter-wafer EWMA baseline
+        are both discarded, so they are rebuilt from scratch starting with
+        the next wafer for this group (the inter-wafer baseline re-freezes
+        after ``inter_wafer.baseline_wafers`` wafers).
+
+        Intra-wafer drift detection is self-calibrating and unaffected — it
+        keeps running on every wafer, including during the post-PM baseline
+        rebuild period.
+        """
+        self._ref_manager.reset(group_key)
+        self._inter_tracker.reset(group_key)
+
     def process_wafer(
         self,
         wafer: WaferData,
         update_reference: bool = True,
+        pm_event: bool = False,
     ) -> list[AnomalyEvent]:
         """
         Process one wafer and return all detected anomaly events.
@@ -52,6 +70,11 @@ class TempVibrationPipeline:
         update_reference :
             If True (default), the reference profile is updated with this
             wafer's data after detection.
+        pm_event :
+            If True, this wafer is the first one after a Preventive
+            Maintenance event: the group's baseline state is reset (see
+            ``reset_baseline``) before processing, so this wafer is treated
+            as a cold-start wafer (reference rebuild only, no detection).
         """
         if not wafer.chips:
             return []
@@ -59,6 +82,9 @@ class TempVibrationPipeline:
         key = wafer.group_key
         if key is None:
             return []
+
+        if pm_event:
+            self.reset_baseline(key)
 
         # --- Step 1: Ensure reference exists (initialize from first wafer) ---
         ref = self._ref_manager.get_or_create(key)

@@ -62,6 +62,17 @@ class ReferenceManager:
     def get(self, key: GroupKey) -> GroupReference | None:
         return self._groups.get(key)
 
+    def reset(self, key: GroupKey) -> None:
+        """
+        Discard the reference profile for a group.
+
+        The next wafer for this group is treated as the first wafer again
+        (reference initialized directly from its pointwise median, no EWMA
+        blending with the pre-reset profile). Use this after a PM event that
+        may have changed the equipment's temperature profile.
+        """
+        self._groups.pop(key, None)
+
     def update(self, wafer: WaferData) -> None:
         """
         Update the temperature reference profile using chips from a new wafer.

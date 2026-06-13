@@ -363,3 +363,120 @@ class TestPipelineIntegration:
         assert ref1 is not None
         assert ref2 is not None
         assert ref1 is not ref2
+
+
+# ---------------------------------------------------------------------------
+# Test 7: PM (Preventive Maintenance) event baseline reset
+# ---------------------------------------------------------------------------
+
+class TestPMBaselineReset:
+    def test_reset_baseline_clears_state(self):
+        """reset_baseline() should discard both the reference profile and
+        the inter-wafer EWMA baseline for the given group."""
+        cfg = _test_config()
+        pipeline = TempVibrationPipeline(cfg)
+        wafers = make_normal_wafer_sequence(
+            n_wafers=12, n_chips=N_CHIPS, n_points=N_POINTS, seed=60
+        )
+        for w in wafers:
+            pipeline.process_wafer(w)
+
+        key = wafers[0].group_key
+        assert pipeline._ref_manager.get(key) is not None
+        assert key in pipeline._inter_tracker._states
+
+        pipeline.reset_baseline(key)
+
+        assert pipeline._ref_manager.get(key) is None
+        assert key not in pipeline._inter_tracker._states
+
+    def test_pm_event_is_cold_start(self):
+        """A wafer flagged with pm_event=True resets the baseline and is
+        itself treated as a cold-start wafer: reference rebuild only, no
+        detection events."""
+        cfg = _test_config()
+        pipeline = TempVibrationPipeline(cfg)
+        wafers = make_normal_wafer_sequence(
+            n_wafers=12, n_chips=N_CHIPS, n_points=N_POINTS, seed=61
+        )
+        for w in wafers[:11]:
+            pipeline.process_wafer(w)
+
+        events = pipeline.process_wafer(wafers[11], pm_event=True)
+        assert events == []
+
+        key = wafers[0].group_key
+        ref = pipeline._ref_manager.get(key)
+        assert ref is not None
+        assert ref.n_wafers_seen == 1
+
+    def test_intra_wafer_detects_during_post_pm_rebuild(self):
+        """
+        intra_wafer drift detection should fire on the very next wafer after
+        a PM event, even while the inter-wafer baseline is still being
+        rebuilt (not yet re-frozen).
+        """
+        cfg = _test_config()
+        pipeline = TempVibrationPipeline(cfg)
+
+        baseline_wafers = make_normal_wafer_sequence(
+            n_wafers=12, n_chips=N_CHIPS, n_points=N_POINTS, seed=62
+        )
+        for w in baseline_wafers:
+            pipeline.process_wafer(w)
+
+        key = baseline_wafers[0].group_key
+
+        # First wafer after PM: cold start, reference rebuild only.
+        cold_start = make_normal_wafer(
+            wafer_id="POST_PM_000", n_chips=N_CHIPS, n_points=N_POINTS,
+            rng=np.random.default_rng(63),
+        )
+        events = pipeline.process_wafer(cold_start, pm_event=True)
+        assert events == []
+
+        # Second wafer after PM: progressive vibration increase.
+        rng = np.random.default_rng(64)
+        anomaly_wafer = make_intra_vibration_wafer(
+            wafer_id="POST_PM_001", n_chips=N_CHIPS, n_points=N_POINTS,
+            onset_fraction=0.5, max_noise_multiplier=6.0, rng=rng,
+        )
+        events = pipeline.process_wafer(anomaly_wafer)
+        intra_events = [e for e in events if e.anomaly_type == "intra_drift"]
+        assert len(intra_events) > 0, (
+            "Expected intra_drift alert on the wafer right after a PM event"
+        )
+
+        # The inter-wafer baseline has only 1 post-PM sample so far and is
+        # not yet re-frozen.
+        state = pipeline._inter_tracker._states[key]
+        assert state.baseline_frozen is False
+
+    def test_inter_wafer_baseline_refreezes_after_pm(self):
+        """After a PM reset, the inter-wafer baseline re-freezes once
+        ``baseline_wafers`` new wafers have been processed."""
+        cfg = _test_config()
+        pipeline = TempVibrationPipeline(cfg)
+
+        baseline_wafers = make_normal_wafer_sequence(
+            n_wafers=12, n_chips=N_CHIPS, n_points=N_POINTS, seed=65
+        )
+        for w in baseline_wafers:
+            pipeline.process_wafer(w)
+
+        key = baseline_wafers[0].group_key
+        pipeline.reset_baseline(key)
+
+        rng = np.random.default_rng(66)
+        post_pm_wafers = [
+            make_normal_wafer(
+                wafer_id=f"POST_PM_{i:03d}", n_chips=N_CHIPS, n_points=N_POINTS, rng=rng
+            )
+            for i in range(cfg.inter_wafer.baseline_wafers + 1)
+        ]
+        for w in post_pm_wafers:
+            pipeline.process_wafer(w)
+
+        state = pipeline._inter_tracker._states[key]
+        assert state.baseline_frozen is True
+        assert state.n_samples == cfg.inter_wafer.baseline_wafers

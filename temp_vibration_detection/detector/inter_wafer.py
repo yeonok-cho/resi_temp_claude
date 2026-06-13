@@ -59,6 +59,16 @@ class InterWaferTracker:
             self._states[group_key] = InterWaferState()
         return self._states[group_key]
 
+    def reset(self, group_key: GroupKey) -> None:
+        """
+        Discard the EWMA baseline for a group.
+
+        The next ``baseline_wafers`` observations re-accumulate a fresh
+        baseline (no inter_drift alarms during that window), after which the
+        baseline is frozen again. Use this after a PM event.
+        """
+        self._states.pop(group_key, None)
+
     def update_and_detect(
         self,
         group_key: GroupKey,
