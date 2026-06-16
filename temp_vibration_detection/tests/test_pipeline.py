@@ -8,6 +8,10 @@ normal data.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+
 import numpy as np
 import pytest
 
@@ -18,6 +22,7 @@ from ..config import (
     InterWaferConfig,
     FeatureConfig,
 )
+from ..data_models import GroupKey
 from ..pipeline import TempVibrationPipeline
 from ..simulator import (
     make_normal_wafer_sequence,
@@ -480,3 +485,174 @@ class TestPMBaselineReset:
         state = pipeline._inter_tracker._states[key]
         assert state.baseline_frozen is True
         assert state.n_samples == cfg.inter_wafer.baseline_wafers
+
+
+# ---------------------------------------------------------------------------
+# Test 8: initialize_baseline / save_baseline / load_baseline
+# ---------------------------------------------------------------------------
+
+class TestBaselineInit:
+    def _pipeline(self) -> TempVibrationPipeline:
+        return TempVibrationPipeline(_test_config())
+
+    def test_initialize_baseline_builds_reference(self):
+        """After initialize_baseline, the reference profile should be set."""
+        pipeline = self._pipeline()
+        key = GroupKey("EQ01", "R001", "H1")
+        wafers = make_normal_wafer_sequence(n_wafers=8, n_chips=N_CHIPS, n_points=N_POINTS, seed=200)
+        pipeline.initialize_baseline(key, wafers)
+
+        ref = pipeline._ref_manager.get(key)
+        assert ref is not None
+        assert ref.is_initialized()
+        assert len(ref.temp_ref) == N_POINTS
+        assert ref.n_wafers_seen == len(wafers)
+
+    def test_initialize_baseline_freezes_inter_wafer_baseline(self):
+        """If enough wafers are provided, the inter-wafer baseline should freeze."""
+        cfg = _test_config()
+        pipeline = TempVibrationPipeline(cfg)
+        key = GroupKey("EQ01", "R001", "H1")
+        n = cfg.inter_wafer.baseline_wafers + 2
+        wafers = make_normal_wafer_sequence(n_wafers=n, n_chips=N_CHIPS, n_points=N_POINTS, seed=201)
+        pipeline.initialize_baseline(key, wafers)
+
+        state = pipeline._inter_tracker._states.get(key)
+        assert state is not None
+        assert state.baseline_frozen is True
+
+    def test_initialize_baseline_no_events_returned(self):
+        """initialize_baseline should not raise and should discard any internal events."""
+        pipeline = self._pipeline()
+        key = GroupKey("EQ01", "R001", "H1")
+        wafers = make_normal_wafer_sequence(n_wafers=12, n_chips=N_CHIPS, n_points=N_POINTS, seed=202)
+        # Should not raise; return value is None
+        result = pipeline.initialize_baseline(key, wafers)
+        assert result is None
+
+    def test_initialize_baseline_per_group_independent(self):
+        """Different group keys get independent baselines."""
+        pipeline = self._pipeline()
+        key1 = GroupKey("EQ01", "R001", "H1")
+        key2 = GroupKey("EQ02", "R002", "H2")
+        w1 = make_normal_wafer_sequence(
+            n_wafers=8, n_chips=N_CHIPS, n_points=N_POINTS, equipment_id="EQ01",
+            recipe="R001", head="H1", seed=203,
+        )
+        w2 = make_normal_wafer_sequence(
+            n_wafers=8, n_chips=N_CHIPS, n_points=N_POINTS, equipment_id="EQ02",
+            recipe="R002", head="H2", seed=204,
+        )
+        pipeline.initialize_baseline(key1, w1)
+        pipeline.initialize_baseline(key2, w2)
+
+        ref1 = pipeline._ref_manager.get(key1)
+        ref2 = pipeline._ref_manager.get(key2)
+        assert ref1 is not None and ref2 is not None
+        assert ref1 is not ref2
+        assert not np.allclose(ref1.temp_ref, ref2.temp_ref)
+
+    def test_initialize_baseline_resets_prior_state(self):
+        """Calling initialize_baseline twice should discard the first baseline."""
+        pipeline = self._pipeline()
+        key = GroupKey("EQ01", "R001", "H1")
+        w1 = make_normal_wafer_sequence(n_wafers=6, n_chips=N_CHIPS, n_points=N_POINTS, seed=210)
+        w2 = make_normal_wafer_sequence(n_wafers=6, n_chips=N_CHIPS, n_points=N_POINTS, seed=211)
+        pipeline.initialize_baseline(key, w1)
+        ref_after_w1 = pipeline._ref_manager.get(key).temp_ref.copy()
+        pipeline.initialize_baseline(key, w2)
+        ref_after_w2 = pipeline._ref_manager.get(key).temp_ref
+        # The second initialization should give a different reference
+        assert not np.allclose(ref_after_w1, ref_after_w2)
+
+    def test_save_and_load_baseline_round_trip(self):
+        """save_baseline + load_baseline should exactly restore all state."""
+        cfg = _test_config()
+        pipeline_a = TempVibrationPipeline(cfg)
+        key = GroupKey("EQ01", "R001", "H1")
+        wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.inter_wafer.baseline_wafers + 2,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=220,
+        )
+        pipeline_a.initialize_baseline(key, wafers)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            path = tmp.name
+        try:
+            pipeline_a.save_baseline(path)
+
+            pipeline_b = TempVibrationPipeline(cfg)
+            pipeline_b.load_baseline(path)
+
+            ref_a = pipeline_a._ref_manager.get(key)
+            ref_b = pipeline_b._ref_manager.get(key)
+            assert ref_b is not None
+            assert ref_b.n_wafers_seen == ref_a.n_wafers_seen
+            assert np.allclose(ref_a.temp_ref, ref_b.temp_ref)
+
+            st_a = pipeline_a._inter_tracker._states[key]
+            st_b = pipeline_b._inter_tracker._states[key]
+            assert st_b.baseline_frozen == st_a.baseline_frozen
+            assert st_b.baseline_mean == pytest.approx(st_a.baseline_mean)
+            assert st_b.baseline_std == pytest.approx(st_a.baseline_std)
+            assert st_b.n_samples == st_a.n_samples
+        finally:
+            os.unlink(path)
+
+    def test_saved_json_is_valid_and_readable(self):
+        """save_baseline should produce a valid JSON file with expected keys."""
+        pipeline = self._pipeline()
+        key = GroupKey("EQ01", "R001", "H1")
+        wafers = make_normal_wafer_sequence(n_wafers=6, n_chips=N_CHIPS, n_points=N_POINTS, seed=230)
+        pipeline.initialize_baseline(key, wafers)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
+            path = tmp.name
+        try:
+            pipeline.save_baseline(path)
+            with open(path) as f:
+                doc = json.load(f)
+            assert "version" in doc
+            assert "created_at" in doc
+            assert "config" in doc
+            assert "groups" in doc
+            assert len(doc["groups"]) == 1
+            g = doc["groups"][0]
+            assert g["group_key"] == {"equipment_id": "EQ01", "recipe": "R001", "head": "H1"}
+            assert "temp_ref" in g["reference"]
+            assert len(g["reference"]["temp_ref"]) == N_POINTS
+        finally:
+            os.unlink(path)
+
+    def test_load_baseline_enables_immediate_detection(self):
+        """After loading a frozen baseline, the next anomalous wafer should be detected."""
+        cfg = _test_config()
+        pipeline_a = TempVibrationPipeline(cfg)
+        key = GroupKey("EQ01", "R001", "H1")
+        wafers = make_normal_wafer_sequence(
+            n_wafers=cfg.inter_wafer.baseline_wafers + 2,
+            n_chips=N_CHIPS, n_points=N_POINTS, seed=240,
+        )
+        pipeline_a.initialize_baseline(key, wafers)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            path = tmp.name
+        try:
+            pipeline_a.save_baseline(path)
+
+            pipeline_b = TempVibrationPipeline(cfg)
+            pipeline_b.load_baseline(path)
+
+            rng = np.random.default_rng(241)
+            anomaly_wafer = make_intra_vibration_wafer(
+                wafer_id="ANOM_AFTER_LOAD",
+                n_chips=N_CHIPS, n_points=N_POINTS,
+                onset_fraction=0.4, max_noise_multiplier=8.0, rng=rng,
+            )
+            events = pipeline_b.process_wafer(anomaly_wafer)
+            intra_events = [e for e in events if e.anomaly_type == "intra_drift"]
+            assert len(intra_events) > 0, (
+                "Expected intra_drift alert immediately after loading frozen baseline"
+            )
+        finally:
+            os.unlink(path)
