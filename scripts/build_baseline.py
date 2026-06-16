@@ -3,13 +3,15 @@ Build per-GroupKey baseline JSON for temp_vibration_detection.
 
 Strategy per GroupKey
 ---------------------
-1. Query wafers from (today-30d) to yesterday (historical window).
-2. If >= MIN_BASELINE_WAFERS found  →  full baseline: reference profile + inter-wafer EWMA.
-3. If <  MIN_BASELINE_WAFERS found  →  also query today's wafers and use them to
-   supplement the **reference profile only** (not the inter-wafer tracker).
-   When production wafers arrive, intra-wafer (CUSUM) fires immediately but
-   inter-wafer (EWMA) accumulates from production data first.
-4. Groups with zero wafers in both windows are skipped (no state written).
+최근 데이터부터 주(week) 단위로 역순 쿼리해서 그룹별로 MIN_BASELINE_WAFERS장이
+채워지면 해당 그룹은 더 이상 과거를 조회하지 않는다. 최대 MAX_LOOKBACK_DAYS까지
+탐색한다.
+
+- 역사 wafer >= MIN_BASELINE_WAFERS → reference + inter-wafer 완전 baseline
+- 역사 wafer < MIN_BASELINE_WAFERS  → 역사분 먼저 쌓고, 오늘 데이터로 reference만
+  보완 (inter-wafer tracker 건너뜀). production wafer 유입 시 intra 탐지는 즉시 작동,
+  inter 탐지는 production wafer가 쌓이면서 점진적으로 활성화.
+- 역사 wafer = 0                    → 오늘 데이터로 reference만 구축 (intra only)
 
 Output
 ------
@@ -49,27 +51,25 @@ parser = argparse.ArgumentParser(description="Build temperature vibration baseli
 parser.add_argument("--output", type=str, default="/workspace/baseline.json",
                     help="저장할 JSON 파일 경로 (default: /workspace/baseline.json)")
 parser.add_argument("--min-wafers", type=int, default=5,
-                    help="그룹당 최소 역사 wafer 수. 미달 시 오늘 데이터로 보완 (default: 5)")
+                    help="그룹당 최소 역사 wafer 수 (default: 5)")
+parser.add_argument("--max-lookback-days", type=int, default=30,
+                    help="최대 과거 탐색 일수 (default: 30)")
+parser.add_argument("--chunk-days", type=int, default=7,
+                    help="한 번에 쿼리할 일수 단위 (default: 7)")
 args = parser.parse_args()
 
 MIN_BASELINE_WAFERS: int = args.min_wafers
+MAX_LOOKBACK_DAYS: int = args.max_lookback_days
+CHUNK_DAYS: int = args.chunk_days
 
-# ──────────────────────────────────────────────
-# 날짜 범위 계산
-# ──────────────────────────────────────────────
 today = date.today()
-yesterday = today - timedelta(days=1)
-thirty_days_ago = today - timedelta(days=30)
-
-HIST_START = f"{thirty_days_ago} 00:00:00"
-HIST_END   = f"{yesterday} 23:59:59"
 TODAY_START = f"{today} 00:00:00"
 TODAY_END   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-print(f"역사 구간  : {HIST_START} ~ {HIST_END}")
-print(f"오늘 구간  : {TODAY_START} ~ {TODAY_END}")
-print(f"최소 wafer : {MIN_BASELINE_WAFERS}")
-print(f"출력 경로  : {args.output}")
+print(f"최소 wafer        : {MIN_BASELINE_WAFERS}")
+print(f"최대 탐색 (일)    : {MAX_LOOKBACK_DAYS}")
+print(f"쿼리 단위 (일)    : {CHUNK_DAYS}")
+print(f"출력 경로         : {args.output}")
 print()
 
 # ──────────────────────────────────────────────
@@ -103,17 +103,12 @@ def create_chip(row, bond_order: int) -> ChipData:
     )
 
 
-def df_to_wafers(df: pd.DataFrame) -> dict[GroupKey, list[tuple[datetime, WaferData]]]:
-    """
-    DataFrame → {GroupKey: [(first_event_ts, WaferData), ...]} (시간 순 정렬).
-    칩은 event_tmstp 오름차순, wafer 목록도 first_ts 오름차순.
-    """
+def df_to_wafers(df: pd.DataFrame) -> dict[GroupKey, list[tuple]]:
+    """DataFrame → {GroupKey: [(first_ts, WaferData), ...]} 시간 오름차순."""
     if df.empty:
         return {}
-
     group_cols = [c for c in ['eqp_id', 'product', 'module_id', 'wafer_id'] if c in df.columns]
     result: dict[GroupKey, list[tuple]] = {}
-
     for _, wafer_df in df.groupby(group_cols, sort=False):
         wafer_df = wafer_df.sort_values('event_tmstp')
         chips = []
@@ -123,27 +118,19 @@ def df_to_wafers(df: pd.DataFrame) -> dict[GroupKey, list[tuple[datetime, WaferD
                 chips.append(chip)
         if not chips:
             continue
-
         first_ts = wafer_df['event_tmstp'].iloc[0]
         wafer_id_val = str(wafer_df['wafer_id'].iloc[0])
         gk = chips[0].group_key
         result.setdefault(gk, []).append(
             (first_ts, WaferData(wafer_id=wafer_id_val, chips=chips))
         )
-
-    # 각 그룹 내 wafer 시간 순 정렬
-    return {
-        gk: sorted(ts_list, key=lambda x: x[0])
-        for gk, ts_list in result.items()
-    }
+    return {gk: sorted(lst, key=lambda x: x[0]) for gk, lst in result.items()}
 
 
 def query_window(start: str, end: str) -> pd.DataFrame:
-    """지정 기간의 전체 데이터를 DataFrame으로 반환."""
     q = f"""
-    SELECT
-        eqp_id, product, module_id, wafer_id,
-        x, y, temp_raw, event_tmstp
+    SELECT eqp_id, product, module_id, wafer_id,
+           x, y, temp_raw, event_tmstp
     FROM ds_catalog.aifpa_cow_rule_hist
     WHERE event_tmstp BETWEEN '{start}' AND '{end}'
     ORDER BY eqp_id, product, module_id, event_tmstp
@@ -156,43 +143,66 @@ def query_window(start: str, end: str) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────
-# 1. 역사 데이터 쿼리 및 wafer 변환
+# 1. 역사 데이터: 주 단위로 역순 쿼리, 그룹별 5장 채워지면 중단
 # ──────────────────────────────────────────────
-print("역사 데이터 쿼리 중...")
-df_hist = query_window(HIST_START, HIST_END)
-print(f"  → {len(df_hist):,} rows")
+# hist_wafers[gk] = 시간 오름차순 (oldest first)의 (ts, WaferData) 리스트
+hist_wafers: dict[GroupKey, list[tuple]] = {}
+satisfied: set[GroupKey] = set()  # 이미 5장 이상 확보된 그룹
 
-hist_wafers = df_to_wafers(df_hist)
-del df_hist  # 메모리 해제
+chunk_end = today - timedelta(days=1)  # 어제부터 시작
 
-print(f"  → {len(hist_wafers)} groups, "
-      f"총 {sum(len(v) for v in hist_wafers.values())} wafers\n")
+for _ in range((MAX_LOOKBACK_DAYS + CHUNK_DAYS - 1) // CHUNK_DAYS):
+    chunk_start = chunk_end - timedelta(days=CHUNK_DAYS - 1)
+    # 최대 탐색 한계 초과 방지
+    earliest_allowed = today - timedelta(days=MAX_LOOKBACK_DAYS)
+    if chunk_start < earliest_allowed:
+        chunk_start = earliest_allowed
+
+    s = f"{chunk_start} 00:00:00"
+    e = f"{chunk_end} 23:59:59"
+    print(f"  [{s} ~ {e}] 쿼리 중...", end=" ", flush=True)
+
+    df_chunk = query_window(s, e)
+    chunk_wafers = df_to_wafers(df_chunk)
+    del df_chunk
+
+    # 이번 청크 결과를 hist_wafers에 prepend (이번 청크가 더 오래됨)
+    new_groups = 0
+    for gk, ts_list in chunk_wafers.items():
+        if gk not in hist_wafers:
+            hist_wafers[gk] = []
+            new_groups += 1
+        hist_wafers[gk] = ts_list + hist_wafers[gk]  # prepend (더 오래된 것 앞에)
+
+    # 이번 라운드 후 만족 여부 갱신
+    for gk, lst in hist_wafers.items():
+        if len(lst) >= MIN_BASELINE_WAFERS:
+            satisfied.add(gk)
+
+    total_groups = len(hist_wafers)
+    total_wafers = sum(len(v) for v in hist_wafers.values())
+    print(f"groups={total_groups}, wafers={total_wafers}, satisfied={len(satisfied)}/{total_groups}")
+
+    # 모든 알려진 그룹이 만족됐으면 조기 종료
+    if satisfied and satisfied == set(hist_wafers):
+        print("  → 모든 그룹 충족, 탐색 종료")
+        break
+
+    chunk_end = chunk_start - timedelta(days=1)
+    if chunk_end < earliest_allowed:
+        break
+
+print()
 
 # ──────────────────────────────────────────────
-# 2. 오늘 데이터가 필요한 그룹 식별
+# 2. 오늘 데이터 쿼리 (역사 부족 그룹 보완 + 신규 그룹 발견)
 # ──────────────────────────────────────────────
-groups_need_today = {
-    gk for gk, ts_list in hist_wafers.items()
-    if len(ts_list) < MIN_BASELINE_WAFERS
-}
-
-# 역사 데이터가 아예 없는 그룹도 오늘 데이터에서 발견될 수 있으므로
-# 오늘 데이터를 모두 쿼리 후 추가 그룹 포함
-
-today_wafers: dict[GroupKey, list[tuple]] = {}
-if True:  # 항상 오늘 데이터 쿼리 (새로운 그룹이 있을 수 있음)
-    print("오늘 데이터 쿼리 중...")
-    df_today = query_window(TODAY_START, TODAY_END)
-    print(f"  → {len(df_today):,} rows")
-    today_wafers = df_to_wafers(df_today)
-    del df_today
-
-    new_groups = set(today_wafers) - set(hist_wafers)
-    groups_need_today |= new_groups
-
-    print(f"  → {len(today_wafers)} groups")
-    print(f"  역사 부족(<{MIN_BASELINE_WAFERS})으로 오늘 데이터 보완 대상: "
-          f"{len(groups_need_today)} groups\n")
+print(f"오늘 데이터 쿼리 중 ({TODAY_START} ~ {TODAY_END})...", end=" ", flush=True)
+df_today = query_window(TODAY_START, TODAY_END)
+today_wafers = df_to_wafers(df_today)
+del df_today
+print(f"groups={len(today_wafers)}")
+print()
 
 # ──────────────────────────────────────────────
 # 3. 파이프라인 baseline 구축
@@ -200,45 +210,40 @@ if True:  # 항상 오늘 데이터 쿼리 (새로운 그룹이 있을 수 있�
 pipeline = TempVibrationPipeline(config=DEFAULT_CONFIG)
 
 all_group_keys = set(hist_wafers) | set(today_wafers)
-print(f"baseline 구축 시작 (총 {len(all_group_keys)} groups)\n")
+print(f"baseline 구축 (총 {len(all_group_keys)} groups)")
 
 for gk in sorted(all_group_keys):
-    hist_list = [w for _, w in hist_wafers.get(gk, [])]
+    hist_list  = [w for _, w in hist_wafers.get(gk, [])]
     today_list = [w for _, w in today_wafers.get(gk, [])]
-
-    n_hist  = len(hist_list)
-    n_today = len(today_list)
+    n_hist, n_today = len(hist_list), len(today_list)
 
     if n_hist >= MIN_BASELINE_WAFERS:
-        # ── 역사 wafer 충분: 정상 baseline (reference + inter-wafer)
+        # 역사 충분 → reference + inter-wafer 완전 baseline
+        # inter-wafer.baseline_wafers(기본 10)보다 많으면 inter도 동결됨
         pipeline.initialize_baseline(gk, hist_list)
         st = pipeline._inter_tracker._states.get(gk)
         frozen = st.baseline_frozen if st else False
-        print(f"  {gk}: hist={n_hist} → full baseline (inter frozen={frozen})")
+        print(f"  {gk}  hist={n_hist}  → full (inter frozen={frozen})")
 
     elif n_hist > 0:
-        # ── 역사 wafer 부족: 역사로 reference + inter-wafer 부분 구축,
-        #    오늘 데이터는 reference profile 보완만 (inter-wafer tracker 제외)
+        # 역사 부족 → 역사분으로 reference + inter 부분 구축,
+        # 오늘 데이터는 reference 보완만 (inter-wafer 제외)
         pipeline.initialize_baseline(gk, hist_list)
-
-        # 오늘 wafer → reference 보완 (inter-wafer 건너뜀)
         for wafer in today_list:
             pipeline._ref_manager.update(wafer)
-
-        total = n_hist + n_today
         st = pipeline._inter_tracker._states.get(gk)
         frozen = st.baseline_frozen if st else False
-        print(f"  {gk}: hist={n_hist}(<{MIN_BASELINE_WAFERS}), today={n_today} "
-              f"→ ref 보완 (inter frozen={frozen}, 부족 시 production에서 누적)")
+        print(f"  {gk}  hist={n_hist}(<{MIN_BASELINE_WAFERS}) today={n_today}"
+              f"  → ref 보완 (inter frozen={frozen})")
 
     else:
-        # ── 역사 wafer 없음: 오늘 데이터로 reference만 구축
+        # 역사 없음 → 오늘 데이터로 reference만
         if today_list:
             for wafer in today_list:
                 pipeline._ref_manager.update(wafer)
-            print(f"  {gk}: hist=0, today={n_today} → reference only (intra-wafer 탐지만)")
+            print(f"  {gk}  hist=0 today={n_today}  → reference only (intra만)")
         else:
-            print(f"  {gk}: 데이터 없음 → SKIP")
+            print(f"  {gk}  데이터 없음 → SKIP")
 
 print()
 
@@ -246,15 +251,10 @@ print()
 # 4. JSON 저장
 # ──────────────────────────────────────────────
 pipeline.save_baseline(args.output)
-print(f"Baseline JSON 저장 완료: {args.output}")
 
-# ── 요약 ──
-ref_groups = set(pipeline._ref_manager._groups)
-inter_frozen = {
-    gk for gk, st in pipeline._inter_tracker._states.items()
-    if st.baseline_frozen
-}
-print(f"\n요약")
-print(f"  reference 구축  : {len(ref_groups)} groups")
-print(f"  inter 완전 동결 : {len(inter_frozen)} groups")
-print(f"  inter 미동결    : {len(ref_groups) - len(inter_frozen)} groups (intra-wafer 탐지만)")
+ref_groups    = len(pipeline._ref_manager._groups)
+inter_frozen  = sum(1 for st in pipeline._inter_tracker._states.values() if st.baseline_frozen)
+print(f"저장 완료: {args.output}")
+print(f"  reference 구축  : {ref_groups} groups")
+print(f"  inter 완전 동결 : {inter_frozen} groups")
+print(f"  inter 미동결    : {ref_groups - inter_frozen} groups (intra만 즉시 작동)")
