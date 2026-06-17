@@ -8,12 +8,12 @@ This script:
 """
 
 import sys
-sys.path.append('/workspace')
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from clickhouse_driver import Client
 import pandas as pd
 import numpy as np
-import os
 import struct
 import json
 from datetime import datetime, timedelta
