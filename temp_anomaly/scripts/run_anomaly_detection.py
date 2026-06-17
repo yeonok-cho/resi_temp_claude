@@ -38,11 +38,11 @@ Usage
 from __future__ import annotations
 
 import sys
-sys.path.append('/workspace')
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import json
-import os
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd

@@ -12,9 +12,9 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-PROJECT_ROOT = "/workspace"
+PROJECT_ROOT = "/workspace/temp_anomaly"
 STATE_DIR = f"{PROJECT_ROOT}/state"
-OUTPUT_DIR = f"{PROJECT_ROOT}/act_resi/sw_act_resi_anomaly/output"
+OUTPUT_DIR = "/workspace/act_resi/sw_act_resi_anomaly/output"
 MIN_WAFERS = 5
 
 default_args = {
