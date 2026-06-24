@@ -38,14 +38,26 @@ def compute_roughness(residual: np.ndarray) -> float:
     return float(np.std(diff)), diff
 
 
-fig, axes = plt.subplots(4, 2, figsize=(11, 11), sharex=True)
-
-for col, (label, temp_series, color) in enumerate([
+# Compute both chips up front so rows can share identical y-axis scales
+# (without this, matplotlib auto-scales each panel to its own data range,
+# which makes a small-amplitude signal visually look just as "fast" as a
+# large-amplitude one — diff() amplifies sample-to-sample noise regardless
+# of amplitude, so the y-axis scale is what actually shows the difference).
+cols = [
     ("Chip A (normal)", temp_a, "tab:blue"),
     ("Chip B (vibrating)", temp_b, "tab:red"),
-]):
-    residual = temp_series - reference
-    roughness, diff = compute_roughness(residual)
+]
+residuals = [temp_series - reference for _, temp_series, _ in cols]
+roughness_diffs = [compute_roughness(r) for r in residuals]
+
+residual_ylim = max(np.abs(r).max() for r in residuals) * 1.1
+diff_ylim = max(np.abs(d).max() for _, d in roughness_diffs) * 1.1
+
+fig, axes = plt.subplots(4, 2, figsize=(11, 11), sharex=True)
+
+for col, (label, temp_series, color) in enumerate(cols):
+    residual = residuals[col]
+    roughness, diff = roughness_diffs[col]
 
     ax = axes[0, col]
     ax.plot(t, reference, "--", color="grey", label="reference profile")
@@ -56,11 +68,13 @@ for col, (label, temp_series, color) in enumerate([
     ax = axes[1, col]
     ax.plot(t, residual, color=color)
     ax.axhline(0, color="grey", lw=0.8)
+    ax.set_ylim(-residual_ylim, residual_ylim)
     ax.set_title("2) residual = temp_series - reference")
 
     ax = axes[2, col]
     ax.plot(t[1:], diff, color=color)
     ax.axhline(0, color="grey", lw=0.8)
+    ax.set_ylim(-diff_ylim, diff_ylim)
     ax.set_title("3) diff = residual[i+1] - residual[i]")
 
     ax = axes[3, col]
